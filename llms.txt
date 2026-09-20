@@ -1,0 +1,58 @@
+# llama-scripts
+
+> Scripts to configure and run llama.cpp on AMD APU hardware. Self-contained -
+> no system ROCm install required. Uses the Synthetic Autonomic Mind fork of
+> llama.cpp (with AMD-specific optimizations: Laguna S/DFlash, Lightning Indexer,
+> APU tuning). Vulkan (RADV) is the default backend for best stability on
+> RDNA3 iGPUs.
+
+## Why
+
+Agentic AI development on AMD APUs without network access. No API keys, no
+per-token costs, no cloud dependency. The primary target is a Nimo Axis N161
+(Strix Halo, Ryzen AI Max+ 395, Radeon 8060S, 128 GB unified memory). It also
+runs on the Ayaneo Flip KB (7840U / 780M / 32 GB) and the Minisforum UM580
+(5800H / 16 GB), plus any other AMD APU in the detection map.
+
+## Quick start
+
+```bash
+git clone --recurse-submodules https://github.com/fewtarius/llama-scripts.git
+cd llama-scripts
+./scripts/rebuild.sh
+./llama-run.sh --server  # http://localhost:9090
+```
+
+## Key features
+
+- Auto GPU/CPU detection (PCI ID + CPU ISA, Cezanne through Strix Halo)
+- Build orchestration for Vulkan, ROCm, and Metal backends
+- Optimistic-first solver reads GGUF metadata and picks the best config
+- GTT/VRAM memory configuration via kernel parameters (capability-based)
+- MoE expert tracking, multi-agent parallel slots, reasoning model support
+- Model download with split-shard validation and integrity verification
+
+## Repo structure
+
+- `llama-run.sh` - Main entry point (model detection, server launch)
+- `scripts/rebuild.sh` - Build (Vulkan default, optional ROCm)
+- `scripts/detect-gpu.sh` - AMD GPU auto-detection (PCI ID, CPU ISA)
+- `scripts/optimize.sh` - Optimistic-first solver
+- `scripts/apply-ttm-kernel-params.sh` - GTT/VRAM kernel parameter configuration
+- `scripts/benchmark.sh` - Performance testing with TTFT measurement
+- `scripts/install-deps.sh` - System dependency installer
+- `scripts/lib-discover-models.sh` - HuggingFace model discovery
+- `scripts/read_gguf_kv.py` - GGUF metadata reader
+- `scripts/log_analyzer.py` - Benchmark log analysis
+- `llama.cpp/` - Submodule (fork of SyntheticAutonomicMind/llama.cpp)
+
+## Documentation
+
+- README.md - Full documentation
+- AGENTS.md - Technical reference for AI agents
+- SOLVER.md - Solver algorithm and tuning details
+
+## License
+
+Source code: GPL-3.0-or-later
+Documentation: CC-BY-NC-SA-4.0

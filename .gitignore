@@ -1,0 +1,54 @@
+# Dependencies (downloaded from AMD nightlies)
+deps/
+
+# ROCm SDK (alternative location)
+rocm/
+
+# Build output
+src/*/build/
+
+# CMake artifacts (should never be committed)
+__cmake_systeminformation/
+
+# Llama.cpp source (managed as git submodules)
+
+# Python venv (if using)
+# venv/
+
+# Model files (large, not in repo)
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+!benchmarks/**/*.log
+wget-log*
+debug.log
+
+# Download artifacts
+*.tar.gz
+*.zip
+
+# CLIO (managed automatically)
+.clio/*
+!.clio/instructions.md
+patches-archive/
+kv-cache/
+ssd-cache/
+benchmarks/
+ai-assisted/
+
+# Transient
+patches/
+scratch/
+reference/
+
+# Python
+__pycache__/
+*.pyc
+.git-backup/

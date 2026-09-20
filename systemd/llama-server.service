@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 fewtarius
+[Unit]
+Description=Llama.cpp API Server (llama-run)
+Documentation=https://github.com/ggml-org/llama.cpp
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/llama-scripts
+ExecStart=%h/llama-scripts/llama-run.sh \
+    --model Qwen3.6-35B-A3B-UD-Q4_K_XL
+
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-server
+
+[Install]
+WantedBy=default.target

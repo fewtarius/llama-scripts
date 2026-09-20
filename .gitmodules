@@ -1,0 +1,4 @@
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = git@github.com:syntheticautonomicmind/llama.cpp.git
+	branch = stable
