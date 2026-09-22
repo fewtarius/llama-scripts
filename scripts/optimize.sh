@@ -235,6 +235,25 @@ _opt_layer_kv_bytes_per_token() {
         'BEGIN { printf "%.0f", h * (kl * k + vl * v) }'
 }
 
+# Compute effective attention-layer count for KV budgeting with ISWA.
+# Full-attention layers (n_base) use the full ctx; SWA layers (n_swa_layers)
+# only use swa_window tokens. The effective count scales the SWA layers by
+# swa_window/ctx, so small windows at large ctx contribute negligibly.
+_opt_swa_eff_n_attn() {
+    local ctx="$1"
+    local n_base="${SOLVER_N_ATTN_BASE:-0}"
+    local n_swa_layers="${SOLVER_N_ATTN_SWA:-0}"
+    local swa_window="${SOLVER_SWA_WINDOW:-0}"
+    if [[ $n_base -eq 0 && $n_swa_layers -eq 0 ]]; then
+        # No SWA: return the raw n_attn (non-SWA models use n_attn directly)
+        echo "${2:-0}"
+        return
+    fi
+    [[ $ctx -lt 1 ]] && ctx=1
+    awk -v b="$n_base" -v s="$n_swa_layers" -v w="$swa_window" -v c="$ctx" \
+        'BEGIN { v = b + s * w / c; printf "%.4f", v }'
+}
+
 _opt_attn_layers() {
     local n_layer="$1" interval="$2"
     interval=${interval:-1}
@@ -727,6 +746,16 @@ _opt_start_optimistic() {
         if [[ "$model_filename" =~ [Ll]aguna ]] && [[ "$model_filename" =~ Q5_K ]]; then
             SOLVER_UBATCH=4096
         fi
+        # Laguna-S: prefer q8_0/f16 KV (V cache bandwidth-bound on UMA).
+        # The model is 82GB with 110GB GPU budget - f16 V cache fits but
+        # q8_0/f16 is the sweet spot: q8_0 K saves memory while f16 V doubles
+        # decode read bandwidth vs q8_0 V. The solver's phase-1 candidate
+        # scoring already ranks q8_0/f16 (score=25) below f16/f16 (30) but
+        # above q8_0/q8_0 (20), so it will be chosen when f16/f16 doesn't fit.
+        if [[ "$model_filename" =~ [Ll]aguna ]]; then
+            SOLVER_K_TYPE="q8_0"
+            SOLVER_V_TYPE="f16"
+        fi
         # minimax-m2 230B: peak (4096, 4096), +10.2% over default
         if [[ "$model_filename" =~ minimax-m2|minimax_m2|MiniMax-M2 ]]; then
             SOLVER_BATCH=4096
@@ -795,11 +824,22 @@ _reduce_kv_q8_0() {
     [[ "${_SOLVER_DONE_kv_q8_0:-0}" == "1" ]] && return 1
     # Only downgrade from f16/bf16; skip if already at q8 or q4 (upgrading
     # would waste memory, not save it).
-    [[ "$SOLVER_K_TYPE" != "f16" && "$SOLVER_K_TYPE" != "bf16" ]] && return 1
-    SOLVER_K_TYPE="q8_0"
-    SOLVER_V_TYPE="q8_0"
+    # Handles both f16/f16 -> q8_0/q8_0 and q8_0/f16 -> q8_0/q8_0.
+    if [[ "$SOLVER_K_TYPE" == "f16" || "$SOLVER_K_TYPE" == "bf16" ]]; then
+        SOLVER_K_TYPE="q8_0"
+        if [[ "$SOLVER_V_TYPE" == "f16" || "$SOLVER_V_TYPE" == "bf16" ]]; then
+            SOLVER_V_TYPE="q8_0"
+            SOLVER_REASONS+=("KV: q8_0/q8_0")
+        else
+            SOLVER_REASONS+=("KV: q8_0/${SOLVER_V_TYPE}")
+        fi
+    elif [[ "$SOLVER_K_TYPE" == "q8_0" && "$SOLVER_V_TYPE" != "q8_0" ]]; then
+        SOLVER_V_TYPE="q8_0"
+        SOLVER_REASONS+=("KV: q8_0/q8_0")
+    else
+        return 1
+    fi
     _SOLVER_DONE_kv_q8_0=1
-    SOLVER_REASONS+=("KV: q8_0/q8_0")
     return 0
 }
 
@@ -822,6 +862,23 @@ _drop_draft() {
     return 0
 }
 
+_reduce_kv_q8_0_v_only() {
+    [[ "${_SOLVER_DONE_kv_q8_0_v_only:-0}" == "1" ]] && return 1
+    # Downgrade only V cache from f16 to q8_0 (keeps q8_0 K).
+    # This is the step taken when q8_0/f16 is too expensive but
+    # q8_0/q8_0 has already been tried.
+    if [[ "$SOLVER_K_TYPE" != "q8_0" ]]; then
+        return 1
+    fi
+    if [[ "$SOLVER_V_TYPE" != "f16" && "$SOLVER_V_TYPE" != "bf16" ]]; then
+        return 1
+    fi
+    SOLVER_V_TYPE="q8_0"
+    _SOLVER_DONE_kv_q8_0_v_only=1
+    SOLVER_REASONS+=("KV: q8_0/q8_0 (V-only downgrade)")
+    return 0
+}
+
 _reduce_ubatch() {
     [[ $SOLVER_UBATCH -le 512 ]] && return 1
     SOLVER_UBATCH=$(( SOLVER_UBATCH / 2 ))
@@ -833,6 +890,7 @@ _reduce_ubatch() {
 _opt_detune_steps() {
     cat <<'STEPS'
 _reduce_kv_q8_0
+_reduce_kv_q8_0_v_only
 _reduce_kv_q4_0
 _reduce_ubatch
 _reduce_ctx
@@ -853,6 +911,7 @@ solve_optimal_config() {
     _SOLVER_DONE_reduce_ubatch=0
     _SOLVER_DONE_kv_q8_0=0
     _SOLVER_DONE_kv_q4_0=0
+    _SOLVER_DONE_kv_q8_0_v_only=0
 
     _opt_read_gguf_meta "$model_path" || SOLVER_GGUF=()
 
@@ -926,7 +985,38 @@ solve_optimal_config() {
     [[ $kl -eq 0 ]] && kl=256
     [[ $vl -eq 0 ]] && vl=256
 
-    SOLVER_REASONS=()
+    # SWA-aware KV layer accounting. For models with ISWA (e.g. Laguna,
+    # Qwen3, DeepSeek-V2 with SWA), the KV cache is split: full-attention
+    # layers use the full context size, SWA layers only use swa_window
+    # tokens. The solver's KV budget must reflect this or it massively
+    # overestimates KV for large-context SWA models (e.g. Laguna-S: 48
+    # layers, 36 SWA at window=512 vs 12 full layers at ctx=196608).
+    #
+    # We store the raw layer counts and compute the effective n_attn
+    # per ctx candidate via _opt_swa_eff_n_attn() inside the scoring loop.
+    SOLVER_SWA_WINDOW=0
+    SOLVER_N_ATTN_BASE=$n_attn
+    SOLVER_N_ATTN_SWA=0
+
+    local n_swa=$(_opt_gguf sliding_window 0)
+    [[ $n_swa -eq 0 ]] && n_swa=$(_opt_gguf attention.sliding_window 0)
+    SOLVER_SWA_WINDOW="$n_swa"
+
+    if [[ $n_swa -gt 0 && "$fai" -le 1 && "${is_ssm:-false}" != "true" && "${is_qwen4exp:-false}" != "true" ]]; then
+        # SWA pattern period determines how many layers are full vs SWA.
+        # Laguna XS.2 uses period=4 with dense_first=true (1 full, 3 SWA).
+        # Default to 4 if not available; this matches most SWA models.
+        local swa_period=$(_opt_gguf swa_pattern 4)
+        [[ $swa_period -eq 0 ]] && swa_period=4
+        SOLVER_SWA_PERIOD="$swa_period"
+        # dense_first=true (Laguna). The full-attention ratio = 1/period.
+        SOLVER_N_ATTN_SWA=$(( n_attn * (swa_period - 1) / swa_period ))
+        SOLVER_N_ATTN_BASE=$(( n_attn - SOLVER_N_ATTN_SWA ))
+
+        if [[ "${LLAMA_DEBUG_SOLVER:-0}" == "1" ]]; then
+            log_info "Solver KV: SWA detected (window=$n_swa, period=$swa_period, $SOLVER_N_ATTN_BASE base + $SOLVER_N_ATTN_SWA SWA layers)"
+        fi
+    fi
     SOLVER_DRAFT_PATH="$draft_path"
 
     local solver_budget_bytes
@@ -1033,7 +1123,15 @@ solve_optimal_config() {
     local ctx_train=$(_opt_gguf context_length 32768)
     local ctx_values=()
     read -ra ctx_values <<< "$(_opt_build_ctx_candidates "$ctx_train")"
-    local kv_qualities=("f16/f16" "q8_0/q8_0")
+    # KV cache quality candidates. Preference order (scored below):
+    #   f16/f16  - best precision, highest bandwidth (default fallback)
+    #   q8_0/f16 - mixed: q8_0 K saves memory, f16 V doubles decode bandwidth
+    #              vs q8_0 V. The K cache is read once per FA block in the
+    #              prefill dequant-once path, so q8_0 K has minimal bandwidth
+    #              cost; the V cache is streamed every decode token, so f16 V
+    #              is the highest-impact bandwidth optimization.
+    #   q8_0/q8_0 - smallest memory, lowest bandwidth (detune fallback)
+    local kv_qualities=("f16/f16" "q8_0/f16" "q8_0/q8_0")
 
     # Candidate (batch, ubatch) pairs to evaluate. The optimistic defaults
     # (SOLVER_BATCH / SOLVER_UBATCH) come first so the solver prefers them
@@ -1182,6 +1280,7 @@ solve_optimal_config() {
 
                             local kv_score=0
                             [[ "$kvq" == "f16/f16" ]] && kv_score=30
+                            [[ "$kvq" == "q8_0/f16" ]]   && kv_score=25
                             [[ "$kvq" == "q8_0/q8_0" ]] && kv_score=20
                             [[ "$kvq" == "q4_0/q4_0" ]] && kv_score=10
 
@@ -1242,7 +1341,9 @@ solve_optimal_config() {
 
         local kv_per_token_per_layer
         kv_per_token_per_layer=$(_opt_layer_kv_bytes_per_token "$k_type" "$v_type" "$hckv" "$kl" "$vl")
-        local kv_per_token=$(( kv_per_token_per_layer * n_attn ))
+        local _eff_n_attn
+        _eff_n_attn=$(_opt_swa_eff_n_attn "$ctx" "$n_attn")
+        local kv_per_token=$(awk -v k="$kv_per_token_per_layer" -v n="$_eff_n_attn" 'BEGIN { printf "%.0f", k * n }')
 
         local eff_draft_bytes=0
         [[ "$draft_mode" == "enabled" && "$SOLVER_DRAFT_ENABLE" == "true" ]] && eff_draft_bytes="$draft_bytes"
@@ -1416,7 +1517,9 @@ solve_optimal_config() {
     # Recompute kv_per_token for chosen config
     local kv_per_token_per_layer
     kv_per_token_per_layer=$(_opt_layer_kv_bytes_per_token "$SOLVER_K_TYPE" "$SOLVER_V_TYPE" "$hckv" "$kl" "$vl")
-    local kv_per_token=$(( kv_per_token_per_layer * n_attn ))
+    local _eff_n_attn
+    _eff_n_attn=$(_opt_swa_eff_n_attn "$SOLVER_CTX_SIZE" "$n_attn")
+    local kv_per_token=$(awk -v k="$kv_per_token_per_layer" -v n="$_eff_n_attn" 'BEGIN { printf "%.0f", k * n }')
 
     # Phase 2: fine-tune if still over budget
     local _phase2_fit=0
@@ -1553,7 +1656,8 @@ solve_optimal_config() {
 
     # Final cache RAM derivation
     kv_per_token_per_layer=$(_opt_layer_kv_bytes_per_token "$SOLVER_K_TYPE" "$SOLVER_V_TYPE" "$hckv" "$kl" "$vl")
-    kv_per_token=$(( kv_per_token_per_layer * n_attn ))
+    _eff_n_attn=$(_opt_swa_eff_n_attn "$SOLVER_CTX_SIZE" "$n_attn")
+    kv_per_token=$(awk -v k="$kv_per_token_per_layer" -v n="$_eff_n_attn" 'BEGIN { printf "%.0f", k * n }')
 
     local final_offloaded
     final_offloaded=$(_opt_model_gpu_footprint \

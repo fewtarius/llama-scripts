@@ -33,7 +33,7 @@ source "$PROJECT_ROOT/scripts/optimize.sh"
 : "${LLAMA_CTX_SIZE:=65536}"
 : "${LLAMA_N_PREDICT:=256}"
 : "${LLAMA_KV_CACHE_TYPE_K:=q8_0}"
-: "${LLAMA_KV_CACHE_TYPE_V:=q8_0}"
+: "${LLAMA_KV_CACHE_TYPE_V:=f16}"
 : "${LLAMA_PORT:=9090}"
 : "${LLAMA_HOST:=0.0.0.0}"
 : "${LLAMA_PROMPT_MAX:=8}"
@@ -936,7 +936,9 @@ ${YELLOW}Options:${NC}
     -c, --ctx-size N        Context size (default: auto per profile)
     -n, --n-predict N       Tokens to generate
     -ngl, --gpu-layers N    GPU layers (default: 99)
-    --kv-cache-type TYPE    Force KV cache quantization (e.g. q8_0)
+    --kv-cache-type TYPE    Force KV cache type for both K and V (e.g. q8_0)
+    --cache-type-k TYPE     Force K cache type (e.g. q8_0, f16)
+    --cache-type-v TYPE     Force V cache type (e.g. q8_0, f16)
     --interactive           Interactive chat mode (default: server mode)
     --server                Run as API server (default)
     --port PORT             Server port (default: 9090)
@@ -1034,6 +1036,8 @@ while [[ $# -gt 0 ]]; do
         -n|--n-predict) N_PREDICT="$2"; shift 2 ;;
         -ngl|--gpu-layers) GPU_LAYERS="$2"; shift 2 ;;
         --kv-cache-type) KV_CACHE_TYPE_K="$2"; KV_CACHE_TYPE_V="$2"; USER_KV_CACHE_TYPE=1; shift 2 ;;
+        --cache-type-k) KV_CACHE_TYPE_K="$2"; USER_KV_CACHE_TYPE=1; shift 2 ;;
+        --cache-type-v) KV_CACHE_TYPE_V="$2"; USER_KV_CACHE_TYPE=1; shift 2 ;;
         --prompt-max) PROMPT_MAX="$2"; shift 2 ;;
         --checkpoint-min-step) OVERRIDE_CHECKPOINT_EVERY="$2"; shift 2 ;;
         --ctx-checkpoints) OVERRIDE_CTX_CHECKPOINTS="$2"; shift 2 ;;

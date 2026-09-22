@@ -110,6 +110,7 @@ def main():
         "nextn_predict_layers", "ssm.state_size", "full_attention_interval",
         "expert_feed_forward_length", "ssm.inner_size", "ssm.group_count",
         "ssm.time_step_rank", "ssm.conv_kernel", "rope.freq_base",
+        "attention.sliding_window", "sliding_window",
     }
     out = {}
     with open(path, "rb") as f:
