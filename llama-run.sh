@@ -610,6 +610,14 @@ setup_vulkan_env() {
     if [[ -z "${GGML_VK_NODES_PER_SUBMIT:-}" ]]; then
         export GGML_VK_NODES_PER_SUBMIT=100
     fi
+    # Wave32 pinning for coopmat1 FA: the unstable branch added
+    # GGML_VK_FA_WAVE32=1 which narrows the subgroup from 64 to 32 on
+    # wave64 hardware (Strix Halo RDNA3 runs wave64). Up to +11.3% on
+    # head_dim >= 64 because d_per_thread is unchanged while register
+    # pressure drops. Safe to enable unconditionally on RDNA3.
+    if [[ -z "${GGML_VK_FA_WAVE32:-}" ]]; then
+        export GGML_VK_FA_WAVE32=1
+    fi
 }
 
 setup_metal_env() {
