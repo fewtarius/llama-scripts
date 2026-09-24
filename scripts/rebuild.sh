@@ -24,11 +24,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LLAMA_DIR="$PROJECT_ROOT/llama.cpp"
 DEPS_DIR="$PROJECT_ROOT/deps"
 
-# AMD nightly tarball base URL
-ROCM_NIGHTLY_URL="https://rocm.nightlies.amd.com/tarball"
+# AMD stable ROCm pip repository
+ROCM_PIP_INDEX="https://stable.repo.amd.com/rocm/whl-next/"
 
-# Default ROCm version (latest stable)
-ROCM_VERSION="${ROCM_VERSION:-7.14.0a20260612}"
+# ROCm SDK package version (stable)
+ROCM_SDK_VERSION="${ROCM_SDK_VERSION:-10.0.0}"
 
 # Color codes
 RED='\033[0;31m'
@@ -61,7 +61,8 @@ OPTIONS:
     -h, --help      Show this help
 
 ENVIRONMENT:
-    ROCM_VERSION    ROCm SDK version to download (default: $ROCM_VERSION)
+    ROCM_SDK_VERSION  Stable ROCm SDK version (default: $ROCM_SDK_VERSION)
+    ROCM_SDK_VERSION  Stable ROCm SDK version (default: $ROCM_SDK_VERSION)
 
 EXAMPLES:
     $(basename "$0")                    # Build default backend for this platform
@@ -261,7 +262,7 @@ download_rocm() {
     fi
 
     # Check if already extracted
-    if [[ -f "$DEPS_DIR/lib/libamdhip64.so" ]] && [[ "$REBUILD" != true ]]; then
+    if [[ -f "$DEPS_DIR/lib/libamdhip64.so" ]] && [[ -f "$DEPS_DIR/lib/llvm/bin/clang" ]] && [[ "$REBUILD" != true ]]; then
         log_ok "ROCm SDK already installed at $DEPS_DIR"
         return 0
     fi
@@ -272,59 +273,218 @@ download_rocm() {
         rm -rf "$DEPS_DIR"
     fi
 
-    # Tarball naming: gfx900 uses plain name, others use -all- suffix
-    # gfx115* and gfx9* tarballs: no suffix (native architecture)
-    # gfx110X, gfx120X and other combined variants: -all- suffix
-    local tarball_suffix="-all-"
-    case "$LLAMA_ROCM_VARIANT" in
-        gfx900|gfx906|gfx908|gfx90a)
-            # Native architecture tarballs don't use -all- suffix
-            tarball_suffix="-"
+    local rocm_ver="$ROCM_SDK_VERSION"
+    local pip_repo="$ROCM_PIP_INDEX"
+
+    # Map llama-scripts GPU detection to ROCm pip device packages.
+    # LLAMA_ROCM_VARIANT is a tarball variant (e.g. gfx120X) used for nightly
+    # therock tarballs. For stable pip packages we need the actual architecture
+    # (e.g. gfx1151) or an -all- variant for combined architectures.
+    local device_pkg=""
+    case "$LLAMA_GFX_ARCH" in
+        gfx90*)
+            device_pkg="rocm-sdk-device-gfx90a"
+            ;;
+        gfx101*)
+            device_pkg="rocm-sdk-device-gfx1012"
+            ;;
+        gfx103*)
+            device_pkg="rocm-sdk-device-gfx1030"
+            ;;
+        gfx110*)
+            device_pkg="rocm-sdk-device-gfx110X-all"
+            ;;
+        gfx115*)
+            device_pkg="rocm-sdk-device-${LLAMA_GFX_ARCH}"
+            ;;
+        gfx120*)
+            device_pkg="rocm-sdk-device-${LLAMA_GFX_ARCH}"
+            ;;
+        *)
+            # Default to broad -all- variant for combined architecture coverage
+            device_pkg="rocm-sdk-device-gfx110X-all"
             ;;
     esac
-    local tarball="therock-dist-linux-${LLAMA_ROCM_VARIANT}${tarball_suffix}${ROCM_VERSION}.tar.gz"
-    local tarball_url="${ROCM_NIGHTLY_URL}/${tarball}"
+
+    # Packages to download (core, libraries, device-specific, devel headers/cmake)
+    local -a pkgs=(
+        "rocm-sdk-core==${rocm_ver}"
+        "rocm-sdk-libraries==${rocm_ver}"
+        "${device_pkg}==${rocm_ver}"
+        "rocm-sdk-devel==${rocm_ver}"
+    )
+
+    local tmp_wheel_dir
+    tmp_wheel_dir=$(mktemp -d)
+    trap "rm -rf '$tmp_wheel_dir'" RETURN
+
+    log_info "Downloading ROCm SDK ${rocm_ver} (stable) from AMD pip repo..."
+    log_info "Packages: ${pkgs[*]}"
+    log_info "Device variant: $device_pkg"
+    log_info "This is ~2.6 GB total (may take several minutes...)"
+
+    # Download all wheels
+    if ! pip3 download --no-deps -d "$tmp_wheel_dir" "${pkgs[@]}" --index-url "$pip_repo" 2>&1 | tail -5; then
+        log_error "Failed to download ROCm SDK packages"
+        log_error "Try: pip3 download --no-deps -d /tmp/rocm \"${pkgs[*]}\" --index-url $pip_repo"
+        exit 1
+    fi
 
     mkdir -p "$DEPS_DIR"
-    cd "$DEPS_DIR"
 
-    # Check for existing tarball
-    if [[ -f "$tarball" ]]; then
-        log_ok "Using existing tarball: $tarball"
-    else
-       log_info "Downloading ROCm SDK: $tarball"
-        log_info "URL: $tarball_url (3-4 GB, this may take several minutes...)"
-        if ! curl -L --retry 3 -sS -o "$tarball" "$tarball_url"; then
-            log_error "Failed to download ROCm SDK"
-            log_error "Tarball URL: $tarball_url"
-            exit 1
-        fi
+    # --- Extract rocm-sdk-core (biggest, contains compiler + runtime + headers) ---
+    local core_wheel=$(ls "$tmp_wheel_dir"/rocm_sdk_core-*.whl 2>/dev/null | head -1)
+    if [[ -z "$core_wheel" ]]; then
+        log_error "rocm-sdk-core wheel not found"
+        exit 1
+    fi
+    log_info "Extracting rocm-sdk-core..."
+    python3 -c "
+import zipfile, os, shutil
+z = zipfile.ZipFile('$core_wheel')
+prefix = None
+for name in z.namelist():
+    if name.startswith('_rocm_sdk_core/'):
+        prefix = '_rocm_sdk_core/'
+        break
+if not prefix:
+    print('ERROR: _rocm_sdk_core/ prefix not found in wheel')
+    exit(1)
+dest_root = '$DEPS_DIR'
+count = 0
+for name in z.namelist():
+    if name.startswith(prefix) and not name.endswith('/'):
+        relpath = name[len(prefix):]
+        dest = os.path.join(dest_root, relpath)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with z.open(name) as src, open(dest, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+        count += 1
+print(f'  Extracted {count} files')
+"
+
+    # --- Extract rocm-sdk-libraries (hipBLAS, rocBLAS, MIOpen, etc.) ---
+    local libs_wheel=$(ls "$tmp_wheel_dir"/rocm_sdk_libraries-*.whl 2>/dev/null | head -1)
+    if [[ -n "$libs_wheel" ]]; then
+        log_info "Extracting rocm-sdk-libraries..."
+        python3 -c "
+import zipfile, os, shutil
+z = zipfile.ZipFile('$libs_wheel')
+prefix = '_rocm_sdk_libraries/'
+count = 0
+for name in z.namelist():
+    if name.startswith(prefix) and not name.endswith('/'):
+        relpath = name[len(prefix):]
+        dest = os.path.join('$DEPS_DIR', relpath)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with z.open(name) as src, open(dest, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+        count += 1
+print(f'  Extracted {count} files')
+"
     fi
 
-    # Extract
-    log_info "Extracting ROCm SDK..."
-    tar -xzf "$tarball"
+    # --- Extract device-specific code objects ---
+    local device_wheel=$(ls "$tmp_wheel_dir"/rocm_sdk_device_*-$rocm_ver-*.whl 2>/dev/null | head -1)
+    if [[ -n "$device_wheel" ]]; then
+        log_info "Extracting device code for $LLAMA_ROCM_VARIANT..."
+        python3 -c "
+import zipfile, os, shutil
+z = zipfile.ZipFile('$device_wheel')
+# Device wheels may have different top-level prefixes
+prefixes = set()
+for name in z.namelist():
+    if name and not name.endswith('/'):
+        top = name.split('/')[0]
+        if top.startswith('_'):
+            prefixes.add(top + '/')
 
-    # The tarball extracts to a directory named after itself (minus .tar.gz)
-    local extracted_dir="${tarball%.tar.gz}"
-    if [[ -d "$extracted_dir" ]] && [[ ! -d "$DEPS_DIR/lib" ]]; then
-        # Move contents from versioned directory to deps/
-        mv "$extracted_dir"/* "$DEPS_DIR/" 2>/dev/null || true
-        rm -rf "$extracted_dir"
-    elif [[ -d "$extracted_dir" ]]; then
-        rm -rf "$extracted_dir"
+count = 0
+for name in z.namelist():
+    if name.endswith('/'):
+        continue
+    relpath = name
+    for p in prefixes:
+        if name.startswith(p):
+            relpath = name[len(p):]
+            break
+    dest = os.path.join('$DEPS_DIR', relpath)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with z.open(name) as src, open(dest, 'wb') as dst:
+        shutil.copyfileobj(src, dst)
+    count += 1
+print(f'  Extracted {count} files')
+"
     fi
 
-    # Clean up tarball
-    rm -f "$tarball"
+    # --- Extract devel package (cmake config files, additional headers) ---
+    local devel_wheel=$(ls "$tmp_wheel_dir"/rocm_sdk_devel-*.whl 2>/dev/null | head -1)
+    if [[ -n "$devel_wheel" ]]; then
+        log_info "Extracting rocm-sdk-devel (cmake configs)..."
+        python3 -c "
+import zipfile, io, tarfile, os, shutil
+z = zipfile.ZipFile('$devel_wheel')
+# The devel package contains an internal _devel.tar that holds the actual files
+tar_members = [n for n in z.namelist() if n.endswith('_devel.tar')]
+for tar_name in tar_members:
+    data = z.read(tar_name)
+    t = tarfile.open(fileobj=io.BytesIO(data))
+    # Determine the prefix from the first member
+    sample = t.getmembers()[0] if t.getmembers() else None
+    prefix = '_rocm_sdk_devel/'
+    count = 0
+    for m in t.getmembers():
+        if not m.isfile():
+            continue
+        if m.name.startswith(prefix):
+            relpath = m.name[len(prefix):]
+        else:
+            relpath = m.name
+        dest = os.path.join('$DEPS_DIR', relpath)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        f = t.extractfile(m)
+        if f:
+            shutil.copyfileobj(f, open(dest, 'wb'))
+        count += 1
+    print(f'  Extracted {count} files from {tar_name}')
+"
+    fi
+
+    # --- Create symlinks for versioned library names ---
+    # The stable pip packages ship versioned .so files (e.g. libamdhip64.so.7)
+    # but not the unversioned .so symlink. The cmake config files reference
+    # specific versioned filenames. Create symlinks so all references resolve.
+    log_info "Creating compatibility symlinks..."
+    _create_rocm_symlinks "$DEPS_DIR/lib"
+
+    # Clean up temporary wheel directory
+    rm -rf "$tmp_wheel_dir"
+
+    # Fix permissions on executables
+    find "$DEPS_DIR" -type f \( -name "clang*" -o -name "hipcc" -o -name "hipconfig" -o -name "rocm-*" \) -exec chmod +x {} + 2>/dev/null || true
+    find "$DEPS_DIR/lib/llvm/bin" -type f -exec chmod +x {} + 2>/dev/null || true
 
     # Verify
-    if [[ -f "$DEPS_DIR/lib/libamdhip64.so" ]]; then
-        log_ok "ROCm SDK installed to $DEPS_DIR"
+    if [[ -f "$DEPS_DIR/lib/libamdhip64.so" || -f "$DEPS_DIR/lib/libamdhip64.so.7" ]]; then
+        log_ok "ROCm ${rocm_ver} SDK installed to $DEPS_DIR"
         log_info "Libraries: $(ls "$DEPS_DIR/lib/"*.so 2>/dev/null | wc -l) shared objects"
+        
+        # Register library paths with ldconfig so binaries can find them
+        # without needing LD_LIBRARY_PATH sourced
+        local ldconf="/etc/ld.so.conf.d/llama-scripts-rocm.conf"
+        if sudo sh -c "cat > '$ldconf'" 2>/dev/null <<EOF
+$DEPS_DIR/lib/llvm/lib
+$DEPS_DIR/lib
+$DEPS_DIR/lib/rocm_sysdeps/lib
+EOF
+        then
+            sudo ldconfig 2>/dev/null || true
+            log_info "Registered ROCm library paths with ldconfig"
+        else
+            log_warn "Could not register ROCm paths with ldconfig (non-root) - source env.sh before running"
+        fi
     else
         log_error "ROCm SDK extraction failed - libamdhip64.so not found"
-        log_error "Check that the tarball URL is correct: $tarball_url"
         exit 1
     fi
 
@@ -335,6 +495,95 @@ download_rocm() {
         log_error "The SDK may be incomplete or corrupted. Try --rebuild."
         exit 1
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Create symlinks so cmake config files (which reference specific versioned .so
+# filenames) can find the libraries shipped by the stable ROCm packages.
+# -----------------------------------------------------------------------------
+_create_rocm_symlinks() {
+    local lib_dir="$1"
+    [[ -d "$lib_dir" ]] || return 0
+    cd "$lib_dir" || return 0
+
+    # Create unversioned .so symlinks from .so.MAJOR files (or shortest version)
+    # Do this first so the Python step below can use them as fallback candidates.
+    for f in *.so.*; do
+        local base
+        base=$(echo "$f" | sed 's/\.so\..*//')
+        if [[ "$base" != "$f" ]] && [[ ! -L "${base}.so" ]] && [[ ! -f "${base}.so" ]]; then
+            ln -sf "$f" "${base}.so" 2>/dev/null || true
+        fi
+    done
+
+    # For each cmake targets file, find IMPORTED_LOCATION_RELEASE entries and
+    # create symlinks from the referenced versioned name to the actual library
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import os, re, glob
+
+base = '$lib_dir'
+
+# Collect all referenced library names from cmake targets files
+referenced = set()
+for cmake_path in glob.glob(os.path.join(base, 'cmake', '**', '*.cmake'), recursive=True):
+    try:
+        with open(cmake_path) as f:
+            content = f.read()
+        for m in re.finditer(r'lib([a-zA-Z0-9_-]+)\.so\.([0-9][0-9.\-]*)', content):
+            referenced.add(m.group(0))
+    except:
+        pass
+
+created = 0
+for ref in sorted(referenced):
+    if os.path.exists(ref):
+        continue
+    # Find the base library name (strip version entirely)
+    base_name = ref.split('.so')[0] + '.so'
+    # Build candidate paths by progressively stripping version components
+    # e.g. for libhsa-runtime64.so.1.21.0:
+    #   candidates = ['libhsa-runtime64.so', 'libhsa-runtime64.so.1',
+    #                 'libhsa-runtime64.so.1.21', 'libhsa-runtime64.so.1.21.0']
+    # We try longest version suffix first (most specific match)
+    vparts = ref.split('.so.')[1].split('.') if '.so.' in ref else []
+    candidates = [base_name]
+    for i in range(1, len(vparts) + 1):
+        candidates.append(base_name + '.' + '.'.join(vparts[:i]))
+    # Reverse so we try longest match first
+    candidates.reverse()
+
+    found = None
+    for c in candidates:
+        if os.path.exists(c):
+            found = c
+            break
+    if found:
+        os.symlink(found, ref)
+        created += 1
+    else:
+        # Try any matching .so file with the same library prefix
+        for f in os.listdir('.'):
+            if f.startswith(base_name) and '.so' in f and f != ref:
+                if os.path.islink(f) or os.path.isfile(f):
+                    os.symlink(f, ref)
+                    created += 1
+                    break
+
+print(f'  Created {created} compatibility symlinks')
+" || true
+    fi
+
+    # Create unversioned .so symlinks from .so.MAJOR files (or shortest version)
+    for f in *.so.*; do
+        local base
+        base=$(echo "$f" | sed 's/\.so\..*//')
+        if [[ "$base" != "$f" ]] && [[ ! -L "${base}.so" ]] && [[ ! -f "${base}.so" ]]; then
+            ln -sf "$f" "${base}.so" 2>/dev/null || true
+        fi
+    done
+
+    cd - >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -409,6 +658,7 @@ build_rocm() {
        -DCMAKE_HIP_COMPILER="$ROCM_PATH/lib/llvm/bin/clang++" \
       -DCMAKE_HIP_PLATFORM=amd \
       -DCMAKE_HIP_ARCHITECTURES="$hip_arch" \
+      -DCMAKE_HIP_FLAGS="--rocm-path=$ROCM_PATH/lib/llvm" \
        -DGGML_HIP=ON \
         -DGGML_HIPBLAS=ON \
         -DGGML_HIP_NO_VMM=OFF \
@@ -518,7 +768,7 @@ echo -e "${CYAN}  GPU: ${LLAMA_GPU_NAME:-unknown} (${LLAMA_GFX_ARCH:-?})${NC}"
 echo -e "${CYAN}  CPU ISA: ${LLAMA_CPU_ISA:-unknown}${NC}"
 echo -e "${CYAN}  CMake CPU flags: ${LLAMA_CMAKE_CPU_FLAGS:-none}${NC}"
 if [[ "$(uname -s)" != "Darwin" ]]; then
-    echo -e "${CYAN}  ROCm: ${ROCM_VERSION}${NC}"
+    echo -e "${CYAN}  ROCm: ${ROCM_SDK_VERSION}${NC}"
 fi
 echo ""
 
