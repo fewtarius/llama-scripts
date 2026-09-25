@@ -52,6 +52,13 @@ if [[ "$BACKEND" == "rocm" ]]; then
     export LLAMA_BIN="$PROJECT_ROOT/src/llama-rocm/build/bin"
     export PATH="$LLAMA_BIN:$PATH"
     
+    # gfx1151 (RDNA 3.5 / Strix Halo) has a HIP async-execution correctness bug:
+    # batched inference can return garbage. HIP_LAUNCH_BLOCKING=1 serializes
+    # kernel launches and restores correctness. This matches strix-llama.cpp's
+    # ROCm CI configuration (see their README "ROCm and batched inference").
+    # Per-token output is ~25-40% slower, but correctness is required.
+    export HIP_LAUNCH_BLOCKING=1
+    
     # Verify ROCm
     if [[ ! -d "$ROCM_PATH" ]]; then
         echo "ERROR: ROCm SDK not found at $ROCM_PATH"

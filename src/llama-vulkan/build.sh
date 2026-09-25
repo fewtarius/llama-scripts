@@ -39,8 +39,8 @@ cmake "$LLAMA_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang \
     -DCMAKE_CXX_COMPILER=clang++ \
-    -DGGML_HIP=OFF \
-    -DGGML_HIPBLAS=OFF \
+    -DGGML_HIP=ON \
+    -DGGML_HIPBLAS=ON \
     -DGGML_VULKAN=ON \
     -DGGML_VULKAN_USE_COOPMAT=ON \
     -DGGML_RPC=ON \
