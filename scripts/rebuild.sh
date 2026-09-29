@@ -168,7 +168,7 @@ check_prereqs() {
         fi
     fi
 
-    # curl, git: used for downloading and submodule management
+    # curl: used for downloading ROCm SDK; git: required tooling
     for tool in curl git; do
         if ! command -v "$tool" &>/dev/null; then
             missing+=("$tool")
@@ -587,48 +587,6 @@ print(f'  Created {created} compatibility symlinks')
 }
 
 # =============================================================================
-# Initialize submodule
-# =============================================================================
-
-init_submodule() {
-    if [[ ! -f "$LLAMA_DIR/CMakeLists.txt" ]]; then
-        log_info "Initializing llama.cpp submodule..."
-        cd "$PROJECT_ROOT"
-        git submodule update --init --recursive
-    fi
-}
-
-# =============================================================================
-# Patch management
-# =============================================================================
-
-apply_patches() {
-    local patch_dir="$PROJECT_ROOT/patches"
-
-    if [[ ! -d "$patch_dir" ]]; then
-        return 0
-    fi
-
-    for patch_file in "$patch_dir"/*.patch; do
-        [[ -f "$patch_file" ]] || continue
-
-        local patch_name
-        patch_name=$(basename "$patch_file")
-
-        # Check if patch is already applied using git apply --check
-        # If --check fails, the patch is already applied or conflicts
-        if ! git -C "$LLAMA_DIR" apply --check "$patch_file" 2>/dev/null; then
-            log_info "Patch already applied or not applicable: $patch_name"
-            continue
-        fi
-
-        log_info "Applying patch: $patch_name"
-        git -C "$LLAMA_DIR" apply "$patch_file"
-        log_ok "Applied: $patch_name"
-    done
-}
-
-# =============================================================================
 # Build functions
 # =============================================================================
 
@@ -640,9 +598,6 @@ build_rocm() {
     # Clean if requested
     [[ "$CLEAN" == true || "$REBUILD" == true ]] && rm -rf "$build_dir"
     mkdir -p "$build_dir"
-
-    # Apply patches to submodule
-    apply_patches
 
     # Configure
     cd "$build_dir"
@@ -687,9 +642,6 @@ build_vulkan() {
     [[ "$CLEAN" == true || "$REBUILD" == true ]] && rm -rf "$build_dir"
     mkdir -p "$build_dir"
 
-    # Apply patches to submodule
-    apply_patches
-
     # Configure
     cd "$build_dir"
     cmake "$LLAMA_DIR" \
@@ -723,9 +675,6 @@ build_metal() {
     # Clean if requested
     [[ "$CLEAN" == true || "$REBUILD" == true ]] && rm -rf "$build_dir"
     mkdir -p "$build_dir"
-
-    # Apply patches to submodule
-    apply_patches
 
     # Configure
     cd "$build_dir"
@@ -772,10 +721,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 echo ""
 
-# Step 1: Initialize submodule
-init_submodule
-
-# Step 2: Download ROCm SDK (Linux ROCm builds only)
+# Step 1: Download ROCm SDK (Linux ROCm builds only)
 download_rocm
 
 # Step 3: Source environment so ROCm tools (clang, etc.) are on PATH (Linux only)
