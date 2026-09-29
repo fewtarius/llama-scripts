@@ -724,7 +724,7 @@ echo ""
 # Step 1: Download ROCm SDK (Linux ROCm builds only)
 download_rocm
 
-# Step 3: Source environment so ROCm tools (clang, etc.) are on PATH (Linux only)
+# Step 2: Source environment so ROCm tools (clang, etc.) are on PATH (Linux only)
 if [[ "$(uname -s)" != "Darwin" ]]; then
     if [[ "$BUILD_ROCM" == true || "$BUILD_VULKAN" == true ]]; then
         if [[ "$BUILD_ROCM" == true ]]; then
