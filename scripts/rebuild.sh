@@ -736,10 +736,10 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     fi
 fi
 
-# Step 4: Check prerequisites
+# Step 3: Check prerequisites
 check_prereqs
 
-# Step 5: Build requested backends
+# Step 4: Build requested backends
 [[ "$BUILD_ROCM" == true ]]   && build_rocm
 [[ "$BUILD_VULKAN" == true ]] && build_vulkan
 [[ "$BUILD_METAL" == true ]]  && build_metal
