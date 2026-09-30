@@ -571,16 +571,14 @@ LLAMA_HARDWARE_TIER="$(_detect_hardware_tier "$LLAMA_APU_VRAM_GB" "$LLAMA_TOTAL_
 # Detect CPU ISA features (x86 SIMD level for cmake build flags)
 _detect_cpu_isa
 
-# Thread count: use nproc by default
+# Thread count: use nproc by default. The solver (optimize.sh
+# apply_user_overrides) splits this into batch/gen (nproc for batch,
+# nproc/2 for generation) - that is the only halving applied.
+# Hardware tier does NOT adjust thread count: all tiers should be
+# optimized for best performance. Handheld-class systems (Steam Deck,
+# etc.) still benefit from full nproc for batch and nproc/2 for gen,
+# which already leaves headroom for the OS.
 LLAMA_THREADS=$(nproc 2>/dev/null || echo 4)
-# On handheld APUs (limited system RAM, no dedicated VRAM), halve the thread
-# count so OS doesn't get starved. macOS uses unified memory - no throttle
-# needed. Large-APU systems (Strix Halo, 96GB VRAM) keep all cores available
-# since OS-side RAM isn't competing with model weights.
-if [[ "$LLAMA_HARDWARE_TIER" == "handheld" && "$(uname -s)" != "Darwin" ]]; then
-    LLAMA_THREADS=$(( LLAMA_THREADS / 2 ))
-    (( LLAMA_THREADS < 2 )) && LLAMA_THREADS=2
-fi
 
 # =============================================================================
 # Apply user overrides (environment variables take precedence)
