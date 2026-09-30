@@ -52,7 +52,8 @@ source "$PROJECT_ROOT/scripts/optimize.sh"
 : "${LLAMA_CTXCP:=64}"
 : "${LLAMA_CACHE_REUSE:=512}"
 : "${LLAMA_FLASH_ATTN:=auto}"
-: "${LLAMA_LOAD_MODE:=dio}"
+: "${LLAMA_LOAD_MODE:=auto}"
+: "${LLAMA_LAZY_MODE:=auto}"
 : "${LLAMA_FIT:=off}"
 
 # Speculative decoding tuning
@@ -677,11 +678,6 @@ _scan_gguf_arch() {
     if grep -q 'nextn_predict_layers' "$tmp" 2>/dev/null; then
         is_mtp=true
     fi
-    # Detect Qwen3.8-Flash-Next (qwen4exp): has PLE n-gram embeddings,
-    # hyper-connection, and QSA sparse attention. The architecture has an MTP
-    # draft block, but the GGUF may not include MTP tensors (Unsloth quants
-    # typically don't ship them). is_mtp is set only if nextn_predict_layers
-    # is found in the GGUF metadata above.
     # Qwen3.5+ hybrid (qwen3next / Qwen3-Coder-Next): has BOTH MoE
     # (qwen3next.expert_count > 0) AND linear-attention (qwen3next.ssm.*)
     # layers. The bulk of the work is linear recurrence which doesn't
@@ -691,9 +687,9 @@ _scan_gguf_arch() {
     if grep -q 'qwen3next' "$tmp" 2>/dev/null; then
         is_ssm=true
     fi
-    if grep -q 'qwen4exp' "$tmp" 2>/dev/null; then
-        is_qwen4exp=true
-    fi
+    # Note: qwen4exp detection is handled by the solver via
+    # _opt_is_qwen4exp() which reads structured GGUF metadata.
+    # No need to set is_qwen4exp here.
     rm -f "$tmp"
 }
 
@@ -752,12 +748,6 @@ assign_profile() {
     local size_gb=$((MODEL_BYTES / 1073741824))
 
     is_moe="false"; is_ssm="false"; is_mtp="false"; is_qwen4exp="false"
-    if echo "$filename" | grep -qiE "moe|a3b|a8b|flash|expert|gpt-oss"; then
-        is_moe=true
-    fi
-    if echo "$filename" | grep -qiE "ssm|mamba|jamba|falcon-h1|rwkv"; then
-        is_ssm=true
-    fi
     _scan_gguf_arch "$model_path"
 
     prof_dspark=$(_detect_draft_model "$model_path" "dspark")
@@ -795,21 +785,12 @@ assign_profile() {
     OVERRIDE_BATCH_SIZE="--batch-size ${SOLVER_BATCH} --ubatch-size ${SOLVER_UBATCH}"
     LOAD_MODE="${SOLVER_LOAD_MODE}"
 
-    EXTRA_SERVER_ARGS="--no-mmproj --flash-attn ${LLAMA_FLASH_ATTN}"
+    EXTRA_SERVER_ARGS="--no-mmproj --flash-attn ${LLAMA_FLASH_ATTN} --lazy-mode ${LLAMA_LAZY_MODE:-auto}"
 
     if [[ "${is_moe}" == "true" ]]; then
         case "${SOLVER_MOE_STRATEGY}" in
             cpu)
-                local total_mem=$(get_total_memory_bytes)
-                if [[ "${is_qwen4exp:-false}" == "true" ]]; then
-                    # For qwen4exp, PLE offload (-ot) is already added below
-                    # for all strategies. --cpu-moe keeps MoE experts on CPU.
-                    EXTRA_SERVER_ARGS+=" --cpu-moe"
-                elif [[ ${MODEL_BYTES:-0} -lt $total_mem ]]; then
-                    EXTRA_SERVER_ARGS+=" --cpu-moe --load-mode none"
-                else
-                    EXTRA_SERVER_ARGS+=" --cpu-moe"
-                fi
+                EXTRA_SERVER_ARGS+=" --cpu-moe"
                 ;;
             residency)
                 # Partial MoE offload: keep ~30% of model on GPU (attention
@@ -939,6 +920,7 @@ ${YELLOW}Options:${NC}
     --kv-cache-type TYPE    Force KV cache type for both K and V (e.g. q8_0)
     --cache-type-k TYPE     Force K cache type (e.g. q8_0, f16)
     --cache-type-v TYPE     Force V cache type (e.g. q8_0, f16)
+    --load-mode MODE        Override model load mode (auto|none|mmap|mlock|dio)
     --interactive           Interactive chat mode (default: server mode)
     --server                Run as API server (default)
     --port PORT             Server port (default: 9090)
@@ -967,6 +949,7 @@ ${YELLOW}Environment overrides:${NC}
     KV_CACHE_V_OVERRIDE     Force V type (e.g. q4_0)
     MOE_UBATCH_OVERRIDE     Force ubatch size
     CACHE_RAM_OVERRIDE      Force cache-ram in MiB (disables auto-detection)
+    LLAMA_LOAD_MODE_OVERRIDE  Override model load mode (auto|none|mmap|dio|mlock)
     LLAMA_CPU_MOE_STRATEGY  Set to 'residency' to force MoE models to use
                             --n-cpu-moe (30% GPU / 70% RAM) even when the full
                             model fits on GPU
@@ -1019,6 +1002,7 @@ OVERRIDE_CTX_CHECKPOINTS=""
 OVERRIDE_CACHE_RAM="$CACHE_RAM_OVERRIDE"
 OVERRIDE_UBATCH_SIZE=""
 OVERRIDE_MOE_STRATEGY="${LLAMA_CPU_MOE_STRATEGY:-}"
+OVERRIDE_LOAD_MODE="${LLAMA_LOAD_MODE_OVERRIDE:-}"
 OVERRIDE_N_PARALLEL="${LLAMA_PARALLEL:-1}"
 PROMPT_MAX=""
 #EXTRA_COMMON_ARGS="-lv 5"
@@ -1043,6 +1027,7 @@ while [[ $# -gt 0 ]]; do
         --ctx-checkpoints) OVERRIDE_CTX_CHECKPOINTS="$2"; shift 2 ;;
         --checkpoint-every-n-tokens) OVERRIDE_CHECKPOINT_EVERY_N_TOKENS="$2"; SOLVER_CHECKPOINT_EVERY_N_TOKENS="$2"; shift 2 ;;
         --cache-ram) OVERRIDE_CACHE_RAM="$2"; shift 2 ;;
+        --load-mode) OVERRIDE_LOAD_MODE="$2"; shift 2 ;;
         --ubatch-size) OVERRIDE_UBATCH_SIZE="$2"; shift 2 ;;
         --cpu-moe-strategy) OVERRIDE_MOE_STRATEGY="residency"; shift ;;
         --np) OVERRIDE_N_PARALLEL="$2"; shift 2 ;;
@@ -1166,7 +1151,7 @@ print_profile_summary() {
     local chat_template
 
     cache_ram_val=$(_extract_arg --cache-ram "0")
-    load_mode=$(_extract_arg --load-mode "${LOAD_MODE:-dio}")
+    load_mode=$(_extract_arg --load-mode "${LOAD_MODE:-auto}")
     flash_attn=$(_extract_arg --flash-attn "${LLAMA_FLASH_ATTN}")
     slot_sim=$(_extract_arg --slot-prompt-similarity "")
     spec_type=$(_extract_arg --spec-type "")
@@ -1185,11 +1170,7 @@ print_profile_summary() {
     fi
 
     if [[ "$EXTRA_SERVER_ARGS" == *" --cpu-moe "* ]]; then
-        if [[ "$EXTRA_SERVER_ARGS" == *" --load-mode none "* ]]; then
-            moe_strategy="cpu-moe + --load-mode none (RAM)"
-        else
-            moe_strategy="cpu-moe (${load_mode})"
-        fi
+        moe_strategy="cpu-moe (load-mode=${load_mode})"
     elif [[ "$EXTRA_SERVER_ARGS" == *" --n-cpu-moe "* ]]; then
         local n_cpu_moe_val
         n_cpu_moe_val=$(echo "$EXTRA_SERVER_ARGS" | sed -nE 's/.*--n-cpu-moe ([0-9]+).*/\1/p' | head -1)
@@ -1219,6 +1200,7 @@ print_profile_summary() {
     printf '  %-28s %s\n' "MoE experts:"     "$moe_strategy"
     printf '  %-28s %s\n' "Load mode:"       "$load_mode"
     printf '  %-28s %s\n' "Flash attention:" "$flash_attn"
+    printf '  %-28s %s\n' "Lazy mode:"       "$(_extract_arg --lazy-mode auto)"
     printf '  %-28s %s\n' "Reasoning:"       "${OVERRIDE_REASONING:-off} (budget=${OVERRIDE_REASONING_BUDGET:-0})"
     printf '  %-28s %s\n' "MTP draft:"       "$( [[ "${is_mtp:-false}" == "true" ]] && echo "enabled" || echo "off" )"
     printf '  %-28s %s\n' "Qwen4exp arch:"   "$( [[ "${is_qwen4exp:-false}" == "true" ]] && echo "yes" || echo "no" )"

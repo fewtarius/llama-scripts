@@ -586,13 +586,50 @@ _opt_update_cache_ram() {
 }
 
 # -----------------------------------------------------------------------------
+# Decide the optimal --load-mode based on whether the model fits in RAM.
+#
+# llama.cpp load modes (see llama.cpp/include/llama.h):
+#   auto   - mmap if the backend supports it, none otherwise
+#   none   - load all tensors into RAM at startup (fastest access)
+#   mmap   - memory-map the file; lazy page-in on access
+#   dio    - direct I/O (bypasses kernel page cache; slow for warm data)
+#
+# The old code defaulted to "dio" for every model. DirectIO bypasses the
+# kernel page cache, so every tensor access pays a disk read penalty. For
+# any model that fits in system RAM, "none" is dramatically faster because
+# tensors are resident and accesses hit RAM. This caused the 270 t/s ->
+# 1200+ t/s regression when the load-mode was changed from dio to none.
+#
+# Decision logic: if the model + OS reserve fits in available system RAM
+# with at least 10% headroom, use "none". Otherwise use "dio" (page from
+# disk on demand, only loads accessed tensors).
+# -----------------------------------------------------------------------------
+_opt_decide_load_mode() {
+    local model_bytes="${MODEL_BYTES:-0}"
+    local total_ram
+    total_ram=$(_opt_get_total_memory_bytes)
+    [[ $total_ram -eq 0 ]] && { echo "auto"; return; }
+
+    local os_reserve=$(( 4 * 1073741824 ))
+    local avail=$(( total_ram - os_reserve ))
+    [[ $avail -le 0 ]] && { echo "auto"; return; }
+    local threshold=$(( avail * 9 / 10 ))
+
+    if [[ $model_bytes -gt 0 && $model_bytes -le $threshold ]]; then
+        echo "none"
+    else
+        echo "dio"
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Solver
 # -----------------------------------------------------------------------------
 _opt_start_optimistic() {
     # The halo (Strix Halo) archetype is the single default for all devices.
     # No per-device branching - the solver always uses the same defaults.
     SOLVER_MOE_STRATEGY="gpu"
-    SOLVER_LOAD_MODE="dio"
+    SOLVER_LOAD_MODE="auto"
 
     # Detect qwen4exp (Qwen3.8-Flash-Next) architecture from GGUF metadata.
     # This model has a large PLE (n-gram hash embedding) that must be off-
@@ -720,49 +757,6 @@ _opt_start_optimistic() {
     # Sanity: ubatch must be <= batch (llama-server requirement).
     [[ $SOLVER_UBATCH -gt $SOLVER_BATCH ]] && SOLVER_UBATCH=$SOLVER_BATCH
 
-    # Per-model overrides. Some models have a known peak that differs
-    # from the per-archetype default (e.g. gpt-oss 120B peaks at
-    # (8192, 4096) while the halo-moe-large default is (8192, 2048)).
-    # The per-archetype default stays as the "safe" fallback; these
-    # overrides bump the per-archetype to the known peak for specific
-    # models when memory allows.
-    #
-    # Data source: /home/deck/test-results.log (llama-bench sweeps).
-    # See config/model-overrides.sh for the full data set.
-    local model_filename="${MODEL_FILENAME:-}"
-    if [[ -n "$model_filename" ]]; then
-        # gpt-oss 120B: peak (8192, 4096), +12.6% over default
-        if [[ "$model_filename" =~ gpt-oss-?120[bB] ]] || \
-           [[ "$model_filename" =~ gpt-oss.*120[._-] ]]; then
-            SOLVER_UBATCH=4096
-            SOLVER_BATCH=8192
-        fi
-        # gemma4 (A4B MoE): peak (4096, 4096), +8% over default
-        if [[ "$model_filename" =~ gemma-?4|gem4|gemma4 ]]; then
-            SOLVER_BATCH=4096
-            SOLVER_UBATCH=4096
-        fi
-        # Laguna 118B Q5_K: peak (8192, 4096), +6.9% over default
-        if [[ "$model_filename" =~ [Ll]aguna ]] && [[ "$model_filename" =~ Q5_K ]]; then
-            SOLVER_UBATCH=4096
-        fi
-        # Laguna-S: prefer q8_0/f16 KV (V cache bandwidth-bound on UMA).
-        # The model is 82GB with 110GB GPU budget - f16 V cache fits but
-        # q8_0/f16 is the sweet spot: q8_0 K saves memory while f16 V doubles
-        # decode read bandwidth vs q8_0 V. The solver's phase-1 candidate
-        # scoring already ranks q8_0/f16 (score=25) below f16/f16 (30) but
-        # above q8_0/q8_0 (20), so it will be chosen when f16/f16 doesn't fit.
-        if [[ "$model_filename" =~ [Ll]aguna ]]; then
-            SOLVER_K_TYPE="q8_0"
-            SOLVER_V_TYPE="f16"
-        fi
-        # minimax-m2 230B: peak (4096, 4096), +10.2% over default
-        if [[ "$model_filename" =~ minimax-m2|minimax_m2|MiniMax-M2 ]]; then
-            SOLVER_BATCH=4096
-            SOLVER_UBATCH=4096
-        fi
-    fi
-
     local phys_cores=${PHYSICAL_CORES:-}
     if [[ -z "$phys_cores" ]]; then
         if command -v lscpu &>/dev/null; then
@@ -781,7 +775,7 @@ _opt_start_optimistic() {
 
     SOLVER_DRAFT_ENABLE=true
     SOLVER_DRAFT_N_MAX=8
-    SOLVER_LOAD_MODE="${SOLVER_LOAD_MODE:-dio}"
+    SOLVER_LOAD_MODE="${SOLVER_LOAD_MODE:-auto}"
     SOLVER_VK_NPS="${GGML_VK_NODES_PER_SUBMIT:-}"
     SOLVER_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-8192}"
 
@@ -1466,7 +1460,7 @@ solve_optimal_config() {
         # (only 6% of MoE model bytes are GPU-resident under cpu strategy).
         if [[ "${is_moe:-false}" == "true" ]]; then
             SOLVER_MOE_STRATEGY="cpu"
-            SOLVER_LOAD_MODE="none"
+            SOLVER_LOAD_MODE="$(_opt_decide_load_mode)"
         fi
         # Note: 'no fit' message deferred to after phase 2. If phase 2 finds a
         # fit, the message is skipped so llama-run.sh's fast-fail doesn't
@@ -1498,15 +1492,13 @@ solve_optimal_config() {
             residency)  SOLVER_MOE_STRATEGY="residency"; SOLVER_LOAD_MODE="dio" ;;
             *)
                 SOLVER_MOE_STRATEGY="gpu"
-                # qwen4exp: use mmap (not dio) so the 103 GB model file is
-                # paged in on demand rather than loaded wholesale at startup.
-                # The PLE n-gram table is offloaded to CPU via -ot, and the
-                # rest of the model lives in GTT; mmap avoids OOM during load.
-                if [[ "${is_qwen4exp:-false}" == "true" ]]; then
-                    SOLVER_LOAD_MODE="mmap"
-                else
-                    SOLVER_LOAD_MODE="dio"
-                fi
+                # Use hardware-aware load-mode: "none" if model fits in RAM
+                # (fastest access), "dio" if it doesn't (page from disk on
+                # demand). This applies to ALL models, including qwen4exp -
+                # the old per-model guard (qwen4exp -> mmap, everyone else ->
+                # dio) was a performance regression: dio bypasses the kernel
+                # page cache, making warm tensor accesses hit disk.
+                SOLVER_LOAD_MODE="$(_opt_decide_load_mode)"
                 ;;
         esac
         local draft_str=""
@@ -1737,6 +1729,7 @@ apply_user_overrides() {
         SOLVER_OVERRIDES+=("ngl-override")
     fi
     [[ "${OVERRIDE_MOE_STRATEGY:-}" == "residency" ]] && { SOLVER_MOE_STRATEGY="residency"; SOLVER_LOAD_MODE="dio"; SOLVER_OVERRIDES+=("cpu-moe-strategy"); }
+    [[ -n "${OVERRIDE_LOAD_MODE:-}" ]] && { SOLVER_LOAD_MODE="$OVERRIDE_LOAD_MODE"; SOLVER_OVERRIDES+=("load-mode"); }
     [[ "${OVERRIDE_FIT:-}" == "on" ]] && { SOLVER_NGL=-1; SOLVER_OVERRIDES+=("--fit on"); }
     [[ -n "${OVERRIDE_REASONING_BUDGET:-}" ]] && { SOLVER_REASONING_BUDGET="$OVERRIDE_REASONING_BUDGET"; SOLVER_OVERRIDES+=("reasoning-budget"); }
 }
