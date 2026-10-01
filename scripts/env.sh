@@ -46,6 +46,8 @@ _ensure_drirc_unified_heap() {
         need_create=1
     elif ! grep -q 'radv_enable_unified_heap_on_apu' "$drirc" 2>/dev/null; then
         need_create=1
+    elif ! grep -q 'application_name_match' "$drirc" 2>/dev/null; then
+        need_create=1
     fi
 
     if [[ $need_create -eq 1 ]]; then

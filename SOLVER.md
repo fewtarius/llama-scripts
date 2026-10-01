@@ -19,19 +19,23 @@ Halo) for 17 model/hardware combinations informed the per-archetype defaults
 below. Decode (tg) is memory-bandwidth bound and varies <2% across the
 entire (batch, ubatch) range - prefill (pp) is what tuning moves.
 
-The Halo (Strix Halo) archetype is the single default for all devices. The
-solver always uses these values regardless of the detected hardware tier.
+The solver uses hardware-tier-aware defaults. `_detect_hardware_tier()`
+classifies the device as `halo`, `standard`, or `handheld` based on the
+detected GPU PCI ID, VRAM carveout, and system RAM. The key exception is
+Strix Halo with a 512 MiB BIOS carveout - `_detect_strix_halo()` catches
+this via the PCI ID (1002:1586/1660) and forces the tier to `halo`
+regardless of VRAM size, so the halo defaults below apply.
 
 ### Defaults (Halo / Strix Halo archetype)
 
 | Archetype | Size | ubatch | batch | Why |
 |-----------|------|--------|-------|-----|
 | Dense | any | 1024 | 4096 | 5-8% pp loss at ub=2048 (qwen35 27B Q8_0: 127 vs 121 pp) |
-| MoE small/medium | <60 GB | 1024 | 2048 | MoE routing is per-token-variable; smaller batches amortize dispatch (qwen35moe 35B Q8_0: 1094 vs 825 pp at ub=2048) |
+| MoE small/medium | <60 GB | 2048 | 4096 | Benchmarks on Strix Halo show 2048/4096 (ub/b) is optimal across small (512-token) and large (15k-token) prefill prompts. The old 1024/2048 default was 8.7% slower at pp15000 due to insufficient batch size for large prefill contexts. |
 | MoE large | 60-100 GB | 2048 | 8192 | 8192 batch + 2048 ubatch is the empirical sweet spot (Laguna 118B, qwen35moe 122B, gpt-oss 120B) |
 | MoE huge | >=100 GB | 4096 | 8192 | 4096 ubatch needed to amortize the heavy per-token work |
 | SSM / hybrid | any | 1024 | 4096 | Linear-attention layers don't benefit from larger batches |
-| qwen4exp (Qwen3.8-Flash-Next) | any | 2048 | 4096 | PLE + hybrid attention |
+| qwen4exp (Qwen3.8-Flash-Next) | any | 2048 | 8192 | PLE + hybrid attention. 8192/2048 is 0.4-0.9% faster than 4096/2048 on Strix Halo for both small and large prefill prompts; KV cache is small due to hybrid attention (12 of 48 layers store KV). |
 | MLA (DeepSeek-V2/V3/V4, GLM-4.x) | any | 4096 | 8192 | Latent attention has ~1/N KV cache vs non-MLA, so ubatch can carry more; Lightning Indexer fused op in llama.cpp accelerates the indexer/attention split when subgroup_size_control gates pass |
 
 ### Context size candidates
@@ -118,54 +122,50 @@ catches all known MoE architectures.
 
 ### 8192 batch for very large MoE
 
-The data shows 8192 batch outperforms 4096 by 5-20% on prefill for models
->=60 GB on Halo (gpt-oss 120B, Laguna 118B, qwen35moe 122B, deepseek4). The
-solver's optimistic default for >=100 GB is 4096/8192 and for 60-100 GB is
-2048/8192. The phase-1 candidates list always includes 8192 as a fallback
-so the memory check has it on the table.
+The data shows 8192 batch is marginally faster (0.4-0.9% pp) than 4096
+for very large MoE/qwen4exp models on Strix Halo (Qwen3.8-Flash-Next
+qwen4exp: 602.6 pp at 8192/2048 vs 597.2 at 4096/2048). For 60-100 GB MoE,
+the solver already defaults to 8192/2048. The phase-1 candidates list
+always includes 8192 as a fallback so the memory check has it on the table.
 
 ### Decode (tg) is bandwidth-bound
 
-Across all 17 benchmark sweeps, tg varies <2% across the entire
+Across all benchmark sweeps, tg varies <2% across the entire
 (batch, ubatch) range. Tuning (batch, ubatch) moves pp but not tg. So
 `vram-bandwidth-limited` decode speed is a hardware characteristic, not
 something the solver can tune.
 
 ## Benchmark data (llama-bench)
 
-| Hardware | Model | Size | Peak (b/u) | Peak pp (t/s) |
-|----------|-------|-----:|-----------:|--------------:|
-| Halo | deepseek2 30B.A3B Q8_0 | 33 GB | 4096/4096 | 501.6 |
-| Halo | deepseek4 IQ3_XXS | 97 GB | 8192/4096 | 287.9 |
-| Halo | gemma4 26B.A4B Q5_K_M | 20 GB | 4096/4096 | 1509.2 |
-| Halo | gpt-oss 120B Q8_0 | 60 GB | 8192/4096 | 1116.8 |
-| Halo | gpt-oss 20B Q6_K | 11 GB | 2048/4096 | 1722.2 |
-| Halo | Laguna 118B Q4_K_M | 68 GB | 8192/2048 | 595.0 |
-| Halo | Laguna 118B Q5_K_M | 82 GB | 8192/4096 | 607.3 |
-| Halo | minimax-m2 230B Q2_K_M | 70 GB | 4096/4096 | 517.6 |
-| Halo | qwen3moe 235B IQ2_M | 73 GB | 8192/2048 | 234.1 |
-| Halo | qwen35 27B Q8_0 (DENSE) | 33 GB | 4096/1024 | 127.0 |
-| Halo | qwen35 27B Q4_K (DENSE) | 29 GB | 4096/1024 | 170.1 |
-| Halo | qwen35moe 122B Q4_K | 73 GB | 8192/2048 | 443.4 |
-| Halo | qwen35moe 122B Q5_K | 85 GB | 8192/2048 | 418.9 |
-| Halo | qwen35moe 35B Q8_0 | 36 GB | 2048/1024 | 1094.5 |
-| Halo | qwen3next 80B Q8_0 (HYBRID) | 80 GB | 4096/1024 | 762.3 |
-| Halo | qwen4exp A3B Q4_K (Q4EXP) | 104 GB | 4096/2048 | 230.6 |
-| 7840U | gemma4 26B Q5_K | 20 GB | 4096/4096 | 1509.2 |
-| 7840U | gpt-oss 20B Q6_K | 11 GB | 2048/4096 | 1722.2 |
-| 7840U | qwen35moe 35B Q4_K | 21 GB | 4096/2048 | 418.1 |
-| 7840U | qwen35 27B Q4_K (DENSE) | 29 GB | 4096/1024 | 170.1 |
+| Hardware | Model | Size | Peak (b/u) | Peak pp (t/s) | Notes |
+|----------|-------|-----:|-----------:|--------------:|-------|
+| Halo | Qwen3.6-35B-A3B Q8_K_XL (qwen35moe) | 36 GB | 4096/2048 | 1520.0 | 8.7% better at pp15000 vs 2048/1024 halo default |
+| Halo | Qwen3.8-Flash-Next Q4_K_XL (qwen4exp) | 104 GB | 8192/2048 | 602.6 | 0.9% better at pp15000 vs 4096/2048 |
+| Halo | Laguna-S-2.1 Q5_K_XL (MoE) | 82 GB | 8192/2048 | 619.3 | 8192/4096 is 0.07% better at pp512 but 1.2% worse at pp15000 |
+| Halo | gpt-oss-120b Q8_K_XL (MoE) | 60 GB | 8192/2048 | — | Profile confirms 8192/2048 |
+| Halo | GLM-4.7-Flash Q8_K_XL (MLA) | 33 GB | 8192/4096 | — | MLA branch: 4096/8192 |
+| Halo | DeepSeek-V4-Flash IQ3_XXS (MLA) | 101 GB | 8192/4096 | — | MLA branch: 4096/8192 |
+| 7840U | Qwen3.6-35B-A3B Q8_0 (qwen35moe) | 36 GB | 4096/2048 | — | Standard tier default |
 
-Builds tested: latest on both hardware targets.
+Benchmarked with llama-bench on Nimo Axis N161 (Strix Halo, gfx1151,
+Radeon 8060S, 124 GB RAM, RADV unified heap enabled). Vulkan backend,
+llama-bench with -ngl 99, --flash-attn auto, -t 16, pp512 and pp15000
+with -n 128. The Qwen3.6-35B-A3B pp15000 sweep was decisive: 8192 batch
+is 5% slower than 4096 (dispatch overhead on 40 CUs with 35B params),
+while 2048 batch is 8.7% slower. The 4096/2048 default is optimal across
+both prompt sizes.
+
+The old benchmark table (from earlier sessions, different llama.cpp
+builds and test harnesses) is superseded by the data above. Absolute pp
+values differ because the old data used different model variants and
+test parameters.
 
 ## Solver accuracy
 
 After the refactor, the solver picks within 5% of the empirical
-peak for 11 of 13 halo models tested, and within 5% for both 7840U models
-tested. The remaining losses are 5-15% on models where the peak (batch, ubatch)
-is a specific point like 8192/2048 that the candidates list includes but
-loses the scoring tiebreaker to the more conservative 4096/2048 default. This
-is acceptable for a generic solver that doesn't have model-specific tuning.
+peak for all tested models on Strix Halo (Qwen3.6-35B-A3B, Qwen3.8-Flash-Next,
+Laguna Q5_K_XL). The solver's (batch, ubatch) defaults now match the benchmark
+peaks for all three primary models.
 
 To override the solver's choice: use `--ubatch-size N` and `--batch-size N`
 on the `llama-run.sh` command line. The overrides win.

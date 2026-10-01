@@ -321,6 +321,10 @@ _detect_strix_halo() {
 _detect_hardware_tier() {
     local vram_gb="$1"
     local ram_gb="${2:-0}"
+    if [[ "${LLAMA_IS_STRIX_HALO:-0}" == "1" ]]; then
+        echo "halo"
+        return 0
+    fi
     if [[ "$vram_gb" -ge 64 ]]; then
         echo "halo"
     elif [[ "$vram_gb" -ge 16 ]]; then

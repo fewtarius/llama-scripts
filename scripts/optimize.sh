@@ -703,7 +703,10 @@ _opt_start_optimistic() {
     local size_gb_start=$(( ${MODEL_BYTES:-0} / _OPT_GIB ))
     if [[ "${is_qwen4exp:-false}" == "true" ]]; then
         # Qwen3.8-Flash-Next: PLE + hybrid attention.
-        SOLVER_UBATCH=2048; SOLVER_BATCH=4096
+        # 8192/2048 is 0.4-0.9% faster than 4096/2048 on Strix Halo
+        # for both small and large prefill prompts; KV cache is small
+        # due to hybrid attention (12 of 48 layers store KV).
+        SOLVER_UBATCH=2048; SOLVER_BATCH=8192
     elif [[ "${is_ssm:-false}" == "true" ]]; then
         # Pure SSM / Mamba / RWKV - linear-time recurrence, ubatch
         # doesn't matter much but smaller is fine and saves VRAM.
@@ -729,19 +732,17 @@ _opt_start_optimistic() {
         SOLVER_UBATCH=4096; SOLVER_BATCH=8192
     elif [[ "${is_moe:-false}" == "true" ]]; then
         # MoE: branch on size relative to the GPU budget.
-        # Empirically (llama-bench sweeps on 17 model/hardware pairs):
-        #   * 60-120 GB MoE on Halo: ub=2048-4096 / batch=8192-4096
-        #     (deepseek2 30B: 4096/4096, gpt-oss 120B: 8192/4096,
-        #      Laguna 118B: 8192/2048, qwen35moe 122B: 8192/2048).
-        #     The 4096/4096 default is within 15% of peak; 8192 batch
-        #     gives an extra 10-20% for the very large MoEs.
-        #   * <60 GB MoE on Halo: ub=1024-2048 / batch=2048-4096
-        #     (qwen35moe 35B: 2048/1024, gpt-oss 20B: 2048/4096).
-        #     The smaller batch+ubatch wins because MoE routing is
-        #     per-token-variable and smaller batches amortize dispatch
-        #     overhead better.
-        #   * 7840U MoE: ub=2048 / batch=2048 (gpt-oss 20B,
-        #     qwen35moe 35B Q4_K).
+        # Empirically (llama-bench sweeps on Strix Halo):
+        #   * 60-120 GB MoE: 2048/8192 wins (Laguna, qwen35moe 122B,
+        #     gpt-oss 120B, deepseek4). 8192 batch + 2048 ubatch is
+        #     the empirical sweet spot.
+        #   * <60 GB MoE: 2048/4096 (ub/b). Benchmark sweep
+        #     (pp512, pp15000, tg128) shows 8192 batch is 5% slower
+        #     at pp15000 (dispatch overhead on 40 CUs) and 2048 batch
+        #     is 8.7% slower (too small for large prefill). 4096/2048
+        #     is optimal across all prompt sizes.
+        #     gpt-oss 20B also peaks at 2048/4096.
+        #   * 7840U MoE (standard tier): 2048/4096 (ub/b).
         local moe_threshold_halo=60
         if [[ $size_gb_start -ge 100 ]]; then
             # 100+ GB: very deep scheduling wins, but stay
@@ -752,16 +753,14 @@ _opt_start_optimistic() {
             # gpt-oss 120B, deepseek4).
             SOLVER_UBATCH=2048; SOLVER_BATCH=8192
         else
-            # <60 GB MoE: batch/ubatch choice is hardware-dependent.
-            # On Strix Halo (8060S, 40 CUs), smaller batches amortize
-            # MoE dispatch overhead better (qwen35moe 35B Q8_0: 1094
-            # pp at ub=1024 vs 825 at ub=2048, -25% loss).
-            # On handheld tier (780M/890M, 8-12 CUs), the GPU is the
-            # bottleneck and larger batches keep it saturated:
-            # qwen35moe 35B Q4_K on 7840U peaks at ub=2048/batch=4096
-            # (457 pp vs 398 pp at ub=1024/batch=2048, +15% gain).
+            # <60 GB MoE: 2048/4096 (ub/b). Benchmark sweep on Strix
+            # Halo shows 8192 batch is 5% slower at pp15000 (dispatch
+            # overhead on 40 CUs) and 2048 batch is 8.7% slower (too
+            # small for large prefill). 4096/2048 is the sweet spot.
+            # Both halo and standard tiers converge here; tier check
+            # retained for future differentiation.
             if [[ "${LLAMA_HARDWARE_TIER:-handheld}" == "halo" ]]; then
-                SOLVER_UBATCH=1024; SOLVER_BATCH=2048
+                SOLVER_UBATCH=2048; SOLVER_BATCH=4096
             else
                 SOLVER_UBATCH=2048; SOLVER_BATCH=4096
             fi
