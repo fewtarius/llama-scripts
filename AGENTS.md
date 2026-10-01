@@ -251,16 +251,26 @@ calculation automatically reflects the larger GPU-visible pool.
 
 RADV on APUs (`has_dedicated_vram=false`) reports only 2/3 of (VRAM + GTT) as
 the DEVICE_LOCAL heap and 1/3 as host heap (game-compat heuristic in
-`radv_physical_device.c`). `~/.drirc` enables
-`radv_enable_unified_heap_on_apu` for `llama-server`/`llama-cli`/`llama-bench`
-so DEVICE_LOCAL = full VRAM + GTT. Without it, models > 2/3 of GPU-visible
-memory crash with `vk::DeviceLostError` at load.
+`radv_physical_device.c`). The `radv_enable_unified_heap_on_apu` driconf
+option (enabled automatically by `source scripts/env.sh vulkan`) merges the
+full VRAM+GTT pool into a single DEVICE_LOCAL heap. Without it, models > 2/3
+of GPU-visible memory crash with `vk::DeviceLostError` at load.
+
+The `~/.drirc` file is auto-created by `env.sh` for Vulkan backend. To
+override or skip: set `LLAMA_SKIP_UNIFIED_HEAP=1` before sourcing env.sh, or
+edit `~/.drirc` manually (XML attribute format with `application_name_match`).
 
 ### Secondary: Ayaneo Flip KB
 
-7840U / gfx1103 / Radeon 780M, 32 GB physical RAM, 6 GB VRAM carveout via
-`amdgpu.vis_vramlimit=6144`, 18 GB GTT via `amdgpu.gttsize=18432`, ~26 GB
-available to OS.
+7840U / gfx1103 / Radeon 780M, 32 GB physical RAM, 6 GB VRAM carveout,
+18 GB GTT limit, ~25 GB available to OS. Hardware tier: `handheld`.
+
+The 780M (8 CUs) is significantly weaker than Strix Halo's 8060S (40 CUs).
+Benchmark data shows smaller MoE models peak at larger batch/ubatch on 7840U
+(4096/2048 for qwen35moe 35B) vs Halo (2048/1024). The solver uses
+`LLAMA_HARDWARE_TIER` to select hardware-aware defaults:
+- `halo` tier: ub=1024/batch=2048 for <60 GB MoE (dispatch overhead dominates)
+- `handheld` tier: ub=2048/batch=4096 for <60 GB MoE (GPU saturation matters)
 
 ### Tertiary: Minisforum UM580 "zaphod"
 

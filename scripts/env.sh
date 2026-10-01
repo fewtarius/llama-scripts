@@ -30,6 +30,70 @@ fi
 export LLAMA_PROJECT_ROOT="$PROJECT_ROOT"
 
 # =============================================================================
+# Helper: ensure ~/.drirc enables radv unified heap on APU
+# =============================================================================
+# RADV's default on APUs is a 2/3 DEVICE_LOCAL + 1/3 host split of the
+# UMA heap. For llama.cpp this is almost always wrong: it causes the
+# GPU allocator to place tensors in slow host memory (non-device-local)
+# and can crash models > 2/3 of GPU-visible memory with DeviceLost.
+# The radv_enable_unified_heap_on_apu driconf option merges the full
+# VRAM+GTT pool into a single DEVICE_LOCAL heap.
+_ensure_drirc_unified_heap() {
+    local drirc="$HOME/.drirc"
+    local need_create=0
+
+    if [[ ! -f "$drirc" ]]; then
+        need_create=1
+    elif ! grep -q 'radv_enable_unified_heap_on_apu' "$drirc" 2>/dev/null; then
+        need_create=1
+    fi
+
+    if [[ $need_create -eq 1 ]]; then
+        cat > "$drirc" << 'DRICONF_EOF'
+<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE driconf [
+   <!ELEMENT driconf      (device+)>
+   <!ELEMENT device       (application | engine)+>
+   <!ATTLIST device       driver CDATA #IMPLIED
+                          device CDATA #IMPLIED>
+   <!ELEMENT application  (option+)>
+   <!ATTLIST application  name CDATA #REQUIRED
+                          executable CDATA #IMPLIED
+                          executable_regexp CDATA #IMPLIED
+                          sha1 CDATA #IMPLIED
+                          application_name_match CDATA #IMPLIED
+                          application_versions CDATA #IMPLIED>
+   <!ELEMENT engine       (option+)>
+   <!ATTLIST engine       engine_name_match CDATA #REQUIRED
+                          engine_versions CDATA #IMPLIED>
+   <!ELEMENT option       EMPTY>
+   <!ATTLIST option       name CDATA #REQUIRED
+                          value CDATA #REQUIRED>
+]>
+<driconf>
+    <device driver="radv">
+        <application name="llama-bench" application_name_match="llama-bench">
+            <option name="radv_enable_unified_heap_on_apu" value="true" />
+        </application>
+        <application name="llama-server" application_name_match="llama-server">
+            <option name="radv_enable_unified_heap_on_apu" value="true" />
+        </application>
+        <application name="llama-cli" application_name_match="llama-cli">
+            <option name="radv_enable_unified_heap_on_apu" value="true" />
+        </application>
+        <application name="llama-batched-bench" application_name_match="llama-batched-bench">
+            <option name="radv_enable_unified_heap_on_apu" value="true" />
+        </application>
+        <application name="llama-run" application_name_match="llama-run">
+            <option name="radv_enable_unified_heap_on_apu" value="true" />
+        </application>
+    </device>
+</driconf>
+DRICONF_EOF
+    fi
+}
+
+# =============================================================================
 # Backend-specific setup
 # =============================================================================
 if [[ "$BACKEND" == "rocm" ]]; then
@@ -94,6 +158,17 @@ elif [[ "$BACKEND" == "vulkan" ]]; then
     # Ensure LD_LIBRARY_PATH is defined (required by llama-run.sh set -u)
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 
+    # Enable RADV unified heap on APU: makes the full VRAM+GTT pool
+    # available as DEVICE_LOCAL memory. Without this, RADV splits the
+    # UMA heap into 2/3 DEVICE_LOCAL + 1/3 host on Radeon 780M/890M
+    # (e.g. 20 GiB DEVICE_LOCAL instead of 30 GiB), causing tensors to
+    # spill into slow host memory and crashes for models > 2/3 of GPU-visible.
+    # The ~/.drirc file is created if it doesn't exist; users can override
+    # or extend it manually. For more details, see AGENTS.md "GPU detection".
+    if [[ -z "${LLAMA_SKIP_UNIFIED_HEAP:-}" ]]; then
+        _ensure_drirc_unified_heap
+    fi
+
     echo "Vulkan environment loaded:"
     echo "  BACKEND=$BACKEND"
     echo "  LLAMA_BIN=$LLAMA_BIN"
@@ -115,6 +190,7 @@ elif [[ "$BACKEND" == "metal" ]]; then
     echo "  LLAMA_BIN=$LLAMA_BIN"
     echo "  GGML_METAL_DEVICE_DEBUG=$GGML_METAL_DEVICE_DEBUG"
 fi
+
 
 # Alias for convenience
 alias llama-server="$LLAMA_BIN/llama-server"

@@ -618,7 +618,13 @@ _opt_decide_load_mode() {
     if [[ $model_bytes -gt 0 && $model_bytes -le $threshold ]]; then
         echo "none"
     else
-        echo "dio"
+        # mmap (page cache) is strictly better than dio for models that don't
+        # fit in RAM. Both are lazy (tensors loaded on demand), but mmap keeps
+        # accessed pages in the kernel page cache so warm tensor re-reads hit
+        # RAM instead of disk. dio bypasses the page cache entirely, meaning
+        # every tensor access pays a disk read penalty - measurably slower
+        # even with warm cache (e.g. 400 -> 457 t/s pp on Qwen3.6-35B/7840U).
+        echo "mmap"
     fi
 }
 
@@ -746,9 +752,19 @@ _opt_start_optimistic() {
             # gpt-oss 120B, deepseek4).
             SOLVER_UBATCH=2048; SOLVER_BATCH=8192
         else
-            # <60 GB MoE: ub=1024 wins for many (qwen35moe 35B
-            # Q8_0 -25% loss at ub=2048).
-            SOLVER_UBATCH=1024; SOLVER_BATCH=2048
+            # <60 GB MoE: batch/ubatch choice is hardware-dependent.
+            # On Strix Halo (8060S, 40 CUs), smaller batches amortize
+            # MoE dispatch overhead better (qwen35moe 35B Q8_0: 1094
+            # pp at ub=1024 vs 825 at ub=2048, -25% loss).
+            # On handheld tier (780M/890M, 8-12 CUs), the GPU is the
+            # bottleneck and larger batches keep it saturated:
+            # qwen35moe 35B Q4_K on 7840U peaks at ub=2048/batch=4096
+            # (457 pp vs 398 pp at ub=1024/batch=2048, +15% gain).
+            if [[ "${LLAMA_HARDWARE_TIER:-handheld}" == "halo" ]]; then
+                SOLVER_UBATCH=1024; SOLVER_BATCH=2048
+            else
+                SOLVER_UBATCH=2048; SOLVER_BATCH=4096
+            fi
         fi
     else
         # Dense transformer.
@@ -1421,7 +1437,15 @@ solve_optimal_config() {
             # is at least 50% of min_cache_mib, allow the draft-on combo through
             # - the draft model is a small separate GGUF (reclaimable at runtime),
             # whereas KV cache headroom is not.
-            if [[ $solver_budget_bytes -gt 0 && $leftover_mib -lt $min_cache_mib && "$draft_mode" == "enabled" ]]; then
+            #
+            # When min_cache_mib == 0 (n_parallel=1, no prompt cache), the gate
+            # must be skipped entirely. A negative leftover_mib (from integer
+            # rounding of GiB-to-bytes) would erroneously trigger this gate:
+            # -144 MiB leftover with min_cache_mib=0 makes "-144 < 0" true,
+            # blocking a combo that the GPU check already accepted. The fix is
+            # to guard with $min_cache_mib -gt 0 so the gate only fires when a
+            # non-zero cache reservation is actually required.
+            if [[ $solver_budget_bytes -gt 0 && $min_cache_mib -gt 0 && $leftover_mib -lt $min_cache_mib && "$draft_mode" == "enabled" ]]; then
                 local no_draft_mem=$(( mem_needed - eff_draft_bytes ))
                 local no_draft_leftover=$(( (solver_budget_bytes - no_draft_mem) / 1048576 ))
                 local half_min=$(( min_cache_mib / 2 ))
@@ -1430,7 +1454,7 @@ solve_optimal_config() {
                 else
                     continue
                 fi
-            elif [[ $solver_budget_bytes -gt 0 && $leftover_mib -lt $min_cache_mib ]]; then
+            elif [[ $solver_budget_bytes -gt 0 && $min_cache_mib -gt 0 && $leftover_mib -lt $min_cache_mib ]]; then
                 continue
             fi
 

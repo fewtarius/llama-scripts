@@ -282,10 +282,12 @@ cat /proc/cmdline | tr ' ' '\n' | grep -E "amdgpu|ttm"
 
 RADV on APUs (`has_dedicated_vram=false`) reports only 2/3 of (VRAM + GTT) as
 the DEVICE_LOCAL heap and 1/3 as host heap (game-compat heuristic in
-`radv_physical_device.c`). `~/.drirc` enables
-`radv_enable_unified_heap_on_apu` for `llama-server`/`llama-cli`/`llama-bench`
-so DEVICE_LOCAL = full VRAM + GTT. Without it, models > 2/3 of GPU-visible memory
-crash with `vk::DeviceLostError` at load.
+`radv_physical_device.c`). The `radv_enable_unified_heap_on_apu` driconf
+option (auto-created by `source scripts/env.sh vulkan`) merges the full
+VRAM+GTT pool into a single DEVICE_LOCAL heap. Without it, models > 2/3
+of GPU-visible memory crash with `vk::DeviceLostError` at load.
+
+To skip the auto-creation: `LLAMA_SKIP_UNIFIED_HEAP=1 source scripts/env.sh vulkan`
 
 ### GPU and CPU detection
 
