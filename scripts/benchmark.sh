@@ -357,7 +357,7 @@ start_server() {
     cmd+=(--port "$PORT" --host 0.0.0.0)
     [[ -n "$OVERRIDE_BATCH_SIZE" ]] && cmd+=($OVERRIDE_BATCH_SIZE)
     cmd+=(--cache-type-k "$KV_CACHE_TYPE_K" --cache-type-v "$KV_CACHE_TYPE_V")
-    cmd+=(-fa on --jinja)
+    cmd+=(--jinja)
     [[ -n "${OVERRIDE_REASONING:-}" ]] && cmd+=(--reasoning "$OVERRIDE_REASONING")
     cmd+=(--slot-prompt-similarity 0.20)
     cmd+=(--slot-save-path "$SLOT_CACHE_DIR")
@@ -774,7 +774,8 @@ run_bench_test() {
     if [[ -n "${OVERRIDE_BATCH_SIZE:-}" ]]; then
         # OVERRIDE_BATCH_SIZE is "--batch-size X --ubatch-size Y".
         local bsz ubsz
-        read -r _ bsz _ _ ubsz <<< "$OVERRIDE_BATCH_SIZE"
+        bsz=$(echo "$OVERRIDE_BATCH_SIZE" | grep -oP '(?<=\-\-batch-size )\d+')
+        ubsz=$(echo "$OVERRIDE_BATCH_SIZE" | grep -oP '(?<=\-\-ubatch-size )\d+')
         [[ -n "$bsz"  ]] && batch_size="$bsz"
         [[ -n "$ubsz" ]] && ubatch_size="$ubsz"
     fi
@@ -788,7 +789,7 @@ run_bench_test() {
         -ngl "$GPU_LAYERS"
         -t "$THREADS"
         -ctk "$KV_CACHE_TYPE_K" -ctv "$KV_CACHE_TYPE_V"
-        -fa on
+        --flash-attn ${LLAMA_FLASH_ATTN:-auto}
         -b "$batch_size" -ub "$ubatch_size"
         -o json
         --progress
@@ -936,7 +937,7 @@ run_batched_test() {
             -ngl "$GPU_LAYERS"
             -t "$THREADS"
             -ctk "$KV_CACHE_TYPE_K" -ctv "$KV_CACHE_TYPE_V"
-            -fa on
+            --flash-attn ${LLAMA_FLASH_ATTN:-auto}
             --output-format jsonl
         )
 

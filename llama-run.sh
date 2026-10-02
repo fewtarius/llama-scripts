@@ -586,38 +586,14 @@ setup_rocm_env() {
 }
 
 setup_vulkan_env() {
+    # Add bundled deps lib to path (ROCm SDK if built)
     export LD_LIBRARY_PATH="${PROJECT_ROOT:-.}/deps/lib:${LD_LIBRARY_PATH:-}"
-    export MESA_SHADER_CACHE_MAX_SIZE="${MESA_SHADER_CACHE_MAX_SIZE:-2G}"
-    export MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:-$HOME/.cache/mesa_shader_cache}"
-    mkdir -p "$MESA_SHADER_CACHE_DIR"
-    export RADV_PERFTEST="${RADV_PERFTEST:-gplp}"
-    # The unstable Vulkan port added max_nodes_per_submit=64 (was 100) and
-    # max_bytes_per_submit=8GiB (new). On UMA APUs these cause progressive
-    # decode degradation:
-    #
-    # - max_bytes_per_submit counts KV cache view tensors as "byte traffic".
-    #   On UMA the KV cache lives in system RAM; views are just address offsets
-    #   into an already-allocated buffer, not memory transfers. As n_kv grows
-    #   from ~36K to ~83K during a session, each FA node's byte contribution
-    #   doubles, causing more command-buffer submissions and ~14% decode speed
-    #   loss by end of session. Disable the byte threshold entirely.
-    #
-    # - max_nodes_per_submit=100 is the halo/Strix Halo default and is
-    #   safe on UMA. It reduces submission overhead for large multi-layer
-    #   models (48-layer MoE) across all gfx architectures.
-    if [[ -z "${GGML_VK_MAX_MB_PER_SUBMIT:-}" ]]; then
-        export GGML_VK_MAX_MB_PER_SUBMIT=0
-    fi
-    if [[ -z "${GGML_VK_NODES_PER_SUBMIT:-}" ]]; then
-        export GGML_VK_NODES_PER_SUBMIT=100
-    fi
-    # Wave32 pinning for coopmat1 FA: the unstable branch added
-    # GGML_VK_FA_WAVE32=1 which narrows the subgroup from 64 to 32 on
-    # wave64 hardware (Strix Halo RDNA3 runs wave64). Up to +11.3% on
-    # head_dim >= 64 because d_per_thread is unchanged while register
-    # pressure drops. Safe to enable unconditionally on RDNA3.
-    if [[ -z "${GGML_VK_FA_WAVE32:-}" ]]; then
-        export GGML_VK_FA_WAVE32=1
+
+    # Delegate to the shared GPU perf setup (also used by env.sh for
+    # llama-bench and other direct Vulkan binaries).
+    # LLAMA_SKIP_GPU_PERF=1 disables all perf tuning.
+    if [[ -z "${LLAMA_SKIP_GPU_PERF:-}" ]]; then
+        _setup_vulkan_gpu_perf
     fi
 }
 
@@ -1302,7 +1278,7 @@ COMMON_ARGS+=" --load-mode $LOAD_MODE"
 [[ -n "$EXTRA_COMMON_ARGS" ]] && COMMON_ARGS+=" $EXTRA_COMMON_ARGS"
 
 # Server arguments
-SERVER_ARGS="--host $HOST --port $PORT -fa on --jinja"
+SERVER_ARGS="--host $HOST --port $PORT --jinja"
 SERVER_ARGS+=" --reasoning ${OVERRIDE_REASONING:-off}"
 [[ -n "$OVERRIDE_REASONING_BUDGET" && "$OVERRIDE_REASONING_BUDGET" != "0" ]] && SERVER_ARGS+=" --reasoning-budget $OVERRIDE_REASONING_BUDGET"
 SERVER_ARGS+=" -np ${OVERRIDE_N_PARALLEL:-${LLAMA_PARALLEL}} --prio ${LLAMA_PRIO} --prio-batch ${LLAMA_PRIO_BATCH} --metrics"

@@ -96,6 +96,61 @@ DRICONF_EOF
 }
 
 # =============================================================================
+# GPU performance tuning helpers
+# =============================================================================
+_setup_vulkan_gpu_perf() {
+    # Shader cache prevents pipeline compilation stalls on first run
+    export MESA_SHADER_CACHE_MAX_SIZE="${MESA_SHADER_CACHE_MAX_SIZE:-2G}"
+    export MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:-$HOME/.cache/mesa_shader_cache}"
+    mkdir -p "$MESA_SHADER_CACHE_DIR"
+
+    # RADV performance test extensions: gplp = compile pipelines early via
+    # pipeline robustness, reducing runtime stalls on first dispatch.
+    export RADV_PERFTEST="${RADV_PERFTEST:-gplp}"
+
+    # On UMA APUs, the unstable Vulkan port's max_bytes_per_submit default
+    # (8 GiB) counts KV cache view tensors as "byte traffic". On UMA the KV
+    # cache lives in system RAM; views are just address offsets, not memory
+    # transfers. As n_kv grows, this causes more command-buffer submissions
+    # and ~14% decode throughput loss by end of session. Disable the
+    # threshold entirely.
+    if [[ -z "${GGML_VK_MAX_MB_PER_SUBMIT:-}" ]]; then
+        export GGML_VK_MAX_MB_PER_SUBMIT=0
+    fi
+    if [[ -z "${GGML_VK_NODES_PER_SUBMIT:-}" ]]; then
+        export GGML_VK_NODES_PER_SUBMIT=100
+    fi
+
+    # Wave32 pinning for coopmat1 Flash Attention: GGML_VK_FA_WAVE32=1
+    # narrows the subgroup from 64 to 32 on wave64 hardware (Strix Halo
+    # RDNA3 runs wave64). Up to +11.3% on head_dim >= 64 because d_per_thread
+    # is unchanged while register pressure drops. Safe on all RDNA3 variants.
+    if [[ -z "${GGML_VK_FA_WAVE32:-}" ]]; then
+        export GGML_VK_FA_WAVE32=1
+    fi
+
+    # Platform performance profile: "low-power" throttles the iGPU to ~800 MHz
+    # instead of 2.6+ GHz boost. Server logs showed 728 t/s with low-power vs
+    # 1070+ t/s with performance profile for Laguna Q5_K_XL. Try to set it
+    # (may need root or sudo); skip silently if not possible.
+    if [[ ! -f /sys/firmware/acpi/platform_profile ]]; then
+        return 0 2>/dev/null || true
+    fi
+    local current_profile
+    current_profile=$(cat /sys/firmware/acpi/platform_profile 2>/dev/null)
+    if [[ "$current_profile" == "performance" ]]; then
+        return 0 2>/dev/null || true
+    fi
+    if [[ "$current_profile" == "low-power" ]]; then
+        if echo "performance" > /sys/firmware/acpi/platform_profile 2>/dev/null; then
+            :
+        elif sudo -n bash -c 'echo "performance" > /sys/firmware/acpi/platform_profile' 2>/dev/null; then
+            :
+        fi
+    fi
+}
+
+# =============================================================================
 # Backend-specific setup
 # =============================================================================
 if [[ "$BACKEND" == "rocm" ]]; then
@@ -169,6 +224,15 @@ elif [[ "$BACKEND" == "vulkan" ]]; then
     # or extend it manually. For more details, see AGENTS.md "GPU detection".
     if [[ -z "${LLAMA_SKIP_UNIFIED_HEAP:-}" ]]; then
         _ensure_drirc_unified_heap
+    fi
+
+    # GPU performance tuning for AMD APUs (Strix Halo, Phoenix, etc.)
+    # These were previously only set in llama-run.sh's setup_vulkan_env(),
+    # meaning llama-bench and other direct Vulkan binaries ran without them.
+    # The platform_profile must be "performance" — "low-power" throttles
+    # the iGPU to ~800 MHz instead of the 2.6+ GHz boost clock.
+    if [[ -z "${LLAMA_SKIP_GPU_PERF:-}" ]]; then
+        _setup_vulkan_gpu_perf
     fi
 
     echo "Vulkan environment loaded:"

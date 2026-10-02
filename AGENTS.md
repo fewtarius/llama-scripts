@@ -352,6 +352,29 @@ Shared functions in `detect-gpu.sh` and `optimize.sh` are available in
 ./src/llama-vulkan/build/bin/llama-bench -m model.gguf
 ```
 
+### GPU performance profile
+
+On Strix Halo (Nimo Axis N161), the system defaults to the `low-power`
+ACPI platform profile, which throttles the iGPU to ~800 MHz and prevents
+Vulkan compute from reaching boost clocks (2.6+ GHz). Without performance
+mode, llama-server throughput drops by ~20-30% (e.g. 701 t/s vs 730 t/s
+pp average on Laguna Q5_K_XL 82 GB, 21648 tokens).
+
+`source scripts/env.sh vulkan` automatically sets the platform profile to
+`performance` (requires root or passwordless sudo) and exports the Vulkan
+performance tuning variables:
+
+- `RADV_PERFTEST=gplp` - compile pipelines early, reducing stalls
+- `GGML_VK_FA_WAVE32=1` - narrow FA subgroup from 64 to 32 on wave64 hardware
+- `GGML_VK_MAX_MB_PER_SUBMIT=0` - disable byte threshold that causes
+  submission overhead on UMA
+- `GGML_VK_NODES_PER_SUBMIT=100` - reduce command buffer submission overhead
+
+**Important:** `llama-bench` raw throughput numbers are ~40-60% lower than
+`llama-server` numbers because the GPU doesn't boost during llama-bench's
+short warmup cycles. Use `llama-server` (via `./llama-run.sh --server`) for
+accurate performance measurements on Strix Halo.
+
 ### C++ tests
 
 For llama.cpp C++ tests (test-backend-ops, test-sampling, etc.), see
